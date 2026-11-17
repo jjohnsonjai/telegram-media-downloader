@@ -1,0 +1,22 @@
+# Dependencies and build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Session and config (contains secrets)
+session.session
+config.json
+*.session
+*.session-journal
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
