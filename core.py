@@ -2,7 +2,6 @@
 Core Telegram engine using Telethon.
 Handles authentication, channel listing, and high-speed parallel media downloading.
 """
-import os
 import sqlite3
 import asyncio
 import logging
@@ -50,7 +49,6 @@ class DownloadDB:
                 CREATE INDEX IF NOT EXISTS idx_channel
                 ON downloaded(channel_id)
             """)
-            # Migration: add size_bytes column if upgrading from v1
             cols = [r[1] for r in conn.execute("PRAGMA table_info(downloaded)")]
             if "size_bytes" not in cols:
                 conn.execute("ALTER TABLE downloaded ADD COLUMN size_bytes INTEGER DEFAULT 0")
@@ -149,6 +147,8 @@ class TelegramEngine:
                 self._active_count,
             )
 
+    # ── Auth ───────────────────────────────────────────────────────────
+
     async def connect(self) -> bool:
         session_path = str(self.config.app_dir / "session")
         self.client = TelegramClient(
@@ -204,8 +204,9 @@ class TelegramEngine:
                 })
         return channels
 
+    # ── Download engine ────────────────────────────────────────────────
+
     async def download_all_channels(self, channels: list[dict], download_dir: str) -> dict:
-        """Download media from multiple channels with parallel channel + file concurrency."""
         if not self.client:
             raise RuntimeError("Client not connected")
 
@@ -237,7 +238,6 @@ class TelegramEngine:
         return aggregated
 
     async def _download_channel(self, channel_id: int, channel_title: str, download_dir: str) -> dict:
-        """Download all media from a single channel using parallel file downloads."""
         channel_dir = Path(download_dir) / self._safe_name(channel_title)
         channel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,13 +246,39 @@ class TelegramEngine:
         self._log(f"Scanning '{channel_title}'...")
         entity = await self.client.get_entity(channel_id)
 
+        # Parse date filters
+        date_from = None
+        date_to = None
+        if self.config.date_from:
+            try:
+                date_from = datetime.strptime(self.config.date_from, "%Y-%m-%d")
+            except ValueError:
+                pass
+        if self.config.date_to:
+            try:
+                date_to = datetime.strptime(self.config.date_to, "%Y-%m-%d")
+                date_to = date_to.replace(hour=23, minute=59, second=59)
+            except ValueError:
+                pass
+
+        media_types = self.config.media_types  # "all", "photos", "videos"
+
         jobs = []
         async for message in self.client.iter_messages(entity, wait_time=0.3):
             if self._cancel_flag:
                 break
-            job = self._classify_message(message, channel_id, channel_dir)
+
+            # Date filter
+            msg_date = message.date.replace(tzinfo=None)
+            if date_from and msg_date < date_from:
+                continue
+            if date_to and msg_date > date_to:
+                continue
+
+            job = self._classify_message(message, channel_id, channel_dir, media_types)
             if job is None:
                 continue
+
             stats["total"] += 1
             if self.db.is_downloaded(job.file_id) or job.filepath.exists():
                 stats["skipped"] += 1
@@ -329,7 +355,7 @@ class TelegramEngine:
         )
         return stats
 
-    def _classify_message(self, message, channel_id: int, channel_dir: Path) -> DownloadJob | None:
+    def _classify_message(self, message, channel_id: int, channel_dir: Path, media_types: str = "all") -> DownloadJob | None:
         media = message.media
         if not media:
             return None
@@ -339,6 +365,8 @@ class TelegramEngine:
         estimated_size = 0
 
         if isinstance(media, MessageMediaPhoto):
+            if media_types == "videos":
+                return None
             file_id = str(message.id)
             ext = ".jpg"
             if hasattr(media, "photo") and media.photo:
@@ -358,6 +386,8 @@ class TelegramEngine:
             is_video = mime.startswith("video/") or "video" in mime
             is_gif = mime == "image/gif"
             if not (is_video or is_gif):
+                return None
+            if media_types == "photos":
                 return None
             file_id = str(doc.id)
             estimated_size = getattr(doc, "size", 0) or 5_000_000
