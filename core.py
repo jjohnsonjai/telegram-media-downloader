@@ -1,12 +1,11 @@
 """
 Core Telegram engine using Telethon.
-High-speed parallel downloads with chunked file splitting for large media.
+High-speed parallel downloads — stable, no chunking, with disconnect recovery.
 """
 import sqlite3
 import asyncio
 import logging
 import time
-import os
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -19,18 +18,12 @@ from telethon.tl.types import (
     MessageMediaDocument,
     Channel,
     Chat,
-    Document,
 )
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from config import Config
 
 logger = logging.getLogger(__name__)
-
-# ── Chunked download tuning ───────────────────────────────────────────────
-CHUNK_THRESHOLD = 3 * 1024 * 1024   # Files > 3 MB get chunked
-CHUNK_COUNT = 8                     # Number of parallel chunks per file
-CHUNK_RETRIES = 2                   # Retries per chunk
 
 
 class DownloadDB:
@@ -76,6 +69,12 @@ class DownloadDB:
                     (file_id, channel_id, filename, datetime.now().isoformat(), size_bytes),
                 )
 
+    def remove_entry(self, file_id: str):
+        """Remove a download record (e.g. when file was deleted from disk)."""
+        with self._lock:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute("DELETE FROM downloaded WHERE file_id = ?", (file_id,))
+
     def get_stats(self) -> tuple[int, int]:
         with self._lock:
             with sqlite3.connect(str(self.db_path)) as conn:
@@ -94,14 +93,12 @@ class DownloadJob:
     filepath: Path
     channel_id: int
     estimated_size: int = 0
-    document: Document | None = None
-    is_large: bool = False
 
 
 class TelegramEngine:
-    """Core engine with chunked parallel download support."""
+    """Core engine with parallel download support and disconnect recovery."""
 
-    DEFAULT_CONCURRENT_DOWNLOADS = 10
+    DEFAULT_CONCURRENT_DOWNLOADS = 8
     DEFAULT_CONCURRENT_CHANNELS = 2
     MAX_CONCURRENT_DOWNLOADS = 16
 
@@ -121,6 +118,7 @@ class TelegramEngine:
         self._active_count = 0
         self._speed_start = 0.0
         self._speed_lock = threading.Lock()
+        self._disconnect_lock = asyncio.Lock()
 
     def set_callbacks(self, log=None, speed=None):
         self._log_callback = log
@@ -155,6 +153,19 @@ class TelegramEngine:
                 speed,
                 self._active_count,
             )
+
+    async def _ensure_connected(self):
+        """Ensure the client is connected, reconnecting if needed."""
+        if not self.client:
+            return
+        async with self._disconnect_lock:
+            if not self.client.is_connected():
+                self._log("Reconnecting...")
+                try:
+                    await self.client.connect()
+                except Exception as e:
+                    self._log(f"Reconnect failed: {e}")
+                    raise
 
     # ── Auth ───────────────────────────────────────────────────────────
 
@@ -253,6 +264,7 @@ class TelegramEngine:
         stats = {"downloaded": 0, "skipped": 0, "errors": 0, "total": 0}
 
         self._log(f"Scanning '{channel_title}'...")
+        await self._ensure_connected()
         entity = await self.client.get_entity(channel_id)
 
         date_from = None
@@ -287,9 +299,21 @@ class TelegramEngine:
                 continue
 
             stats["total"] += 1
-            if self.db.is_downloaded(job.file_id) or job.filepath.exists():
+
+            # Check DB + disk: if DB says downloaded but file missing, clear DB entry
+            if self.db.is_downloaded(job.file_id):
+                if job.filepath.exists():
+                    stats["skipped"] += 1
+                    continue
+                else:
+                    # File was deleted — remove the stale DB entry
+                    self.db.remove_entry(job.file_id)
+
+            # Belt-and-suspenders: check disk again
+            if job.filepath.exists():
                 stats["skipped"] += 1
                 continue
+
             jobs.append(job)
 
         self._log(
@@ -312,36 +336,38 @@ class TelegramEngine:
                     self._active_count += 1
                 self._emit_speed()
 
-                try:
-                    success, actual_size = await self._download_job(job)
-                    if success:
-                        self.db.mark_downloaded(job.file_id, job.channel_id, job.filename, actual_size)
-                        self._emit_speed(just_finished=actual_size)
-                        self._log(f"  OK {job.filename} ({self._fmt_size(actual_size)})")
-                        return True
-                    else:
-                        self._emit_speed(just_finished=0)
-                        return False
-
-                except FloodWaitError as e:
-                    self._log(f"Rate limited - waiting {e.seconds}s...")
-                    await asyncio.sleep(e.seconds + 1)
+                for attempt in range(3):  # Retry up to 3 times
                     try:
-                        success, actual_size = await self._download_job(job)
-                        if success:
+                        await self._ensure_connected()
+                        message = await self.client.get_messages(job.channel_id, ids=job.message_id)
+                        if not message or not message.media:
+                            break  # No point retrying if message missing
+
+                        path = await self.client.download_media(message, str(job.filepath))
+                        if path:
+                            actual_size = job.filepath.stat().st_size if job.filepath.exists() else job.estimated_size
                             self.db.mark_downloaded(job.file_id, job.channel_id, job.filename, actual_size)
                             self._emit_speed(just_finished=actual_size)
                             self._log(f"  OK {job.filename} ({self._fmt_size(actual_size)})")
                             return True
-                    except Exception:
-                        pass
-                    self._emit_speed(just_finished=0)
-                    return False
+                        break  # download_media returned None — don't retry
 
-                except Exception as e:
-                    self._log(f"Error: {job.filename} - {e}")
-                    self._emit_speed(just_finished=0)
-                    return False
+                    except FloodWaitError as e:
+                        self._log(f"Rate limited - waiting {e.seconds}s...")
+                        await asyncio.sleep(e.seconds + 1)
+                        continue  # Retry after waiting
+
+                    except Exception as e:
+                        err_msg = str(e)
+                        if "disconnected" in err_msg.lower():
+                            self._log(f"Disconnected - reconnecting and retrying ({attempt + 1}/3)...")
+                            await asyncio.sleep(2)
+                            continue  # Retry after reconnect
+                        self._log(f"Error: {job.filename} - {e}")
+                        break  # Don't retry on non-disconnect errors
+
+                self._emit_speed(just_finished=0)
+                return False
 
         tasks = [asyncio.create_task(download_one(job)) for job in jobs]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -358,124 +384,6 @@ class TelegramEngine:
         )
         return stats
 
-    async def _download_job(self, job: DownloadJob) -> tuple[bool, int]:
-        """Download a single file. Uses chunked download for large files.
-        Returns (success, actual_size)."""
-        message = await self.client.get_messages(job.channel_id, ids=job.message_id)
-        if not message or not message.media:
-            return False, 0
-
-        # Determine if chunked download is beneficial
-        if job.is_large and job.document and job.estimated_size > CHUNK_THRESHOLD:
-            return await self._chunked_download(job, message)
-
-        # Single-stream download for small files and photos
-        path = await self.client.download_media(message, str(job.filepath))
-        if path:
-            actual_size = job.filepath.stat().st_size if job.filepath.exists() else job.estimated_size
-            return True, actual_size
-        return False, 0
-
-    async def _chunked_download(self, job: DownloadJob, message) -> tuple[bool, int]:
-        """Download a large file in parallel chunks, then reassemble."""
-        doc = job.document
-        total_size = job.estimated_size
-        chunk_size = total_size // CHUNK_COUNT
-        if chunk_size < 512 * 1024:  # Minimum 512KB per chunk
-            chunk_size = 512 * 1024
-
-        tmp_path = job.filepath.with_suffix(job.filepath.suffix + ".tmp")
-
-        # Calculate chunk ranges
-        chunks = []
-        offset = 0
-        while offset < total_size:
-            end = min(offset + chunk_size, total_size)
-            chunks.append((offset, end - offset))
-            offset = end
-
-        # Limit to CHUNK_COUNT actual chunks
-        if len(chunks) > CHUNK_COUNT:
-            # Recalculate with exact CHUNK_COUNT
-            chunk_size = total_size // CHUNK_COUNT
-            chunks = []
-            offset = 0
-            for i in range(CHUNK_COUNT):
-                if i == CHUNK_COUNT - 1:
-                    size = total_size - offset
-                else:
-                    size = chunk_size
-                chunks.append((offset, size))
-                offset += size
-
-        # Semaphore to limit concurrent chunks per file
-        chunk_sem = asyncio.Semaphore(min(CHUNK_COUNT, 8))
-
-        async def download_chunk(idx: int, offset: int, size: int) -> bytes | None:
-            if self._cancel_flag:
-                return None
-            async with chunk_sem:
-                for attempt in range(CHUNK_RETRIES + 1):
-                    try:
-                        data = b""
-                        async for chunk_data in self.client.iter_download(
-                            doc, offset=offset, request_size=size
-                        ):
-                            data += chunk_data
-                            if len(data) >= size:
-                                break
-                        if data:
-                            return data
-                    except FloodWaitError as e:
-                        if attempt < CHUNK_RETRIES:
-                            await asyncio.sleep(e.seconds + 1)
-                            continue
-                        raise
-                    except Exception:
-                        if attempt < CHUNK_RETRIES:
-                            await asyncio.sleep(1)
-                            continue
-                        raise
-                return None
-
-        # Download all chunks in parallel
-        chunk_tasks = [
-            asyncio.create_task(download_chunk(i, offset, size))
-            for i, (offset, size) in enumerate(chunks)
-        ]
-        chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-
-        # Check for failures
-        if any(r is None or isinstance(r, Exception) for r in chunk_results):
-            # Clean up tmp
-            if tmp_path.exists():
-                tmp_path.unlink()
-            return False, 0
-
-        # Write chunks to temp file
-        try:
-            with open(tmp_path, "wb") as f:
-                for i, (offset, size) in enumerate(chunks):
-                    data = chunk_results[i]
-                    if isinstance(data, bytes):
-                        f.seek(offset)
-                        f.write(data)
-                    else:
-                        raise ValueError(f"Chunk {i} is not bytes: {type(data)}")
-
-            # Atomic rename
-            if job.filepath.exists():
-                job.filepath.unlink()
-            tmp_path.rename(job.filepath)
-            actual_size = job.filepath.stat().st_size
-            return True, actual_size
-
-        except Exception as e:
-            self._log(f"Chunk assembly failed: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()
-            return False, 0
-
     def _classify_message(self, message, channel_id: int, channel_dir: Path, media_types: str = "all") -> DownloadJob | None:
         media = message.media
         if not media:
@@ -484,8 +392,6 @@ class TelegramEngine:
         file_id = None
         ext = ""
         estimated_size = 0
-        document = None
-        is_large = False
 
         if isinstance(media, MessageMediaPhoto):
             if media_types == "videos":
@@ -500,7 +406,6 @@ class TelegramEngine:
                         estimated_size = sz
             if estimated_size == 0:
                 estimated_size = 500_000
-            # Photos are never large enough for chunking
 
         elif isinstance(media, MessageMediaDocument):
             doc = media.document
@@ -515,8 +420,6 @@ class TelegramEngine:
                 return None
             file_id = str(doc.id)
             estimated_size = getattr(doc, "size", 0) or 5_000_000
-            document = doc
-            is_large = estimated_size > CHUNK_THRESHOLD
 
             for attr in doc.attributes:
                 name = getattr(attr, "file_name", None)
@@ -541,8 +444,6 @@ class TelegramEngine:
             filepath=channel_dir / filename,
             channel_id=channel_id,
             estimated_size=estimated_size,
-            document=document,
-            is_large=is_large,
         )
 
     @staticmethod

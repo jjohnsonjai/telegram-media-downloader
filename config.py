@@ -77,7 +77,7 @@ class Config:
 
     @property
     def concurrent_downloads(self) -> int:
-        return self._data.get("concurrent_downloads", 6)
+        return self._data.get("concurrent_downloads", 8)
     @concurrent_downloads.setter
     def concurrent_downloads(self, value: int):
         self._data["concurrent_downloads"] = max(1, min(16, value)); self.save()
