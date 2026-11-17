@@ -185,9 +185,19 @@ class TelegramDownloaderGUI:
         self.cancel_btn = ttk.Button(ctrl_frame, text="Cancel", command=self._on_cancel, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(5, 0))
 
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(ctrl_frame, variable=self.progress_var, mode="indeterminate")
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+        # Concurrency controls
+        ttk.Separator(ctrl_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Label(ctrl_frame, text="Parallel:").pack(side=tk.LEFT)
+        self.concurrency_var = tk.IntVar(value=6)
+        self.concurrency_spin = ttk.Spinbox(
+            ctrl_frame, from_=1, to=12, textvariable=self.concurrency_var,
+            width=3, command=self._on_concurrency_change
+        )
+        self.concurrency_spin.pack(side=tk.LEFT, padx=(2, 0))
+
+        # Speed display
+        self.speed_label = ttk.Label(ctrl_frame, text="", foreground="#0088cc", font=("Consolas", 9))
+        self.speed_label.pack(side=tk.RIGHT, padx=(10, 0))
 
         # Log area
         self.log_text = tk.Text(dl_frame, height=6, state=tk.DISABLED, bg="#1e1e1e", fg="#d4d4d4",
@@ -360,37 +370,48 @@ class TelegramDownloaderGUI:
 
         if not messagebox.askyesno(
             "Confirm Download",
-            f"Download all photos and videos from:\n\n{names}\n\n({count} channel(s))",
+            f"Download all photos and videos from:\n\n{names}\n\n({count} channel(s), {self.engine.concurrent_downloads} parallel)",
         ):
             return
 
         self.download_btn.config(state=tk.DISABLED)
         self.cancel_btn.config(state=tk.NORMAL)
-        self.progress_bar.start(10)
         self.engine.reset_cancel()
-        self.engine.set_callbacks(log=self._append_log)
+        self.engine.set_callbacks(log=self._append_log, speed=self._on_speed_update)
 
         self._run_async(
-            self._download_all(selected_channels, dl_dir),
+            self.engine.download_all_channels(selected_channels, dl_dir),
             self._on_download_complete,
         )
 
-    async def _download_all(self, channels: list[dict], dl_dir: str):
-        total_stats = {"downloaded": 0, "skipped": 0, "errors": 0, "total": 0}
-        for ch in channels:
-            self.engine._log(f"\n--- Processing: {ch['title']} ---")
-            stats = await self.engine.download_channel_media(
-                ch["id"], ch["title"], dl_dir
+    def _on_concurrency_change(self):
+        try:
+            val = self.concurrency_var.get()
+            self.engine.concurrent_downloads = val
+        except Exception:
+            pass
+
+    def _on_speed_update(self, bytes_done: int, bytes_total: int, speed_bps: float, active: int):
+        """Called from engine thread — update speed label on GUI thread."""
+        def _update():
+            if speed_bps > 1_000_000:
+                speed_str = f"{speed_bps / 1_000_000:.1f} MB/s"
+            elif speed_bps > 1_000:
+                speed_str = f"{speed_bps / 1_000:.0f} KB/s"
+            else:
+                speed_str = f"{speed_bps:.0f} B/s"
+
+            done_str = self._fmt_size(bytes_done)
+            total_str = self._fmt_size(bytes_total)
+            self.speed_label.config(
+                text=f"{done_str} / {total_str}  |  {speed_str}  |  {active} active"
             )
-            for k in total_stats:
-                total_stats[k] += stats.get(k, 0)
-        return total_stats
+        self.root.after(0, _update)
 
     def _on_download_complete(self, stats):
         self.download_btn.config(state=tk.NORMAL)
         self.cancel_btn.config(state=tk.DISABLED)
-        self.progress_bar.stop()
-        self.progress_var.set(0)
+        self.speed_label.config(text="")
 
         if stats is None:
             self._append_log("Download failed or was cancelled.")
@@ -417,6 +438,16 @@ class TelegramDownloaderGUI:
     def _show_error(self, msg: str):
         messagebox.showerror("Error", msg)
         self._append_log(f"ERROR: {msg}")
+
+    @staticmethod
+    def _fmt_size(n: int) -> str:
+        if n >= 1_000_000_000:
+            return f"{n / 1_000_000_000:.1f} GB"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f} MB"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f} KB"
+        return f"{n} B"
 
     def _on_close(self):
         self._running = False
