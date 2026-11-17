@@ -80,7 +80,7 @@ class Config:
         return self._data.get("concurrent_downloads", 6)
     @concurrent_downloads.setter
     def concurrent_downloads(self, value: int):
-        self._data["concurrent_downloads"] = max(1, min(12, value)); self.save()
+        self._data["concurrent_downloads"] = max(1, min(16, value)); self.save()
 
     @property
     def concurrent_channels(self) -> int:

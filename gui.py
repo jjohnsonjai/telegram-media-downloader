@@ -533,7 +533,7 @@ class TelegramDownloaderGUI:
         tk.Label(grid1, text="Parallel file downloads", bg=THEME["bg2"],
                  fg=THEME["fg"]).grid(row=0, column=0, sticky=tk.W)
         self.settings_conc = tk.IntVar(value=self.config.concurrent_downloads)
-        ttk.Spinbox(grid1, from_=1, to=12, textvariable=self.settings_conc,
+        ttk.Spinbox(grid1, from_=1, to=16, textvariable=self.settings_conc,
                     width=4, command=self._save_settings).grid(row=0, column=1, padx=(12, 30))
 
         tk.Label(grid1, text="Parallel channels", bg=THEME["bg2"],
