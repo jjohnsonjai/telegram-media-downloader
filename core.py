@@ -150,12 +150,13 @@ class TelegramEngine:
             self._log_callback(msg)
 
     def _emit_speed(self, just_finished: int = 0):
-        if not self._speed_callback:
-            return
+        # Always update counters, even without callback
         with self._speed_lock:
-            self._bytes_downloaded += just_finished
-            if just_finished > 0:
+            self._bytes_downloaded += max(0, just_finished)
+            if just_finished != 0:
                 self._active_count -= 1
+            if not self._speed_callback:
+                return
             elapsed = time.monotonic() - self._speed_start if self._speed_start > 0 else 0
             speed = self._bytes_downloaded / elapsed if elapsed > 0 else 0
             self._speed_callback(
@@ -422,7 +423,7 @@ class TelegramEngine:
                         self._log(f"Error: {job.filename} - {e}")
                         break
 
-                self._emit_speed(just_finished=0)
+                self._emit_speed(just_finished=-1)
                 return False
 
         tasks = [asyncio.create_task(download_one(job)) for job in jobs]
