@@ -1,6 +1,6 @@
 """
 Core Telegram engine using Telethon.
-High-speed parallel downloads — stable, no chunking, with disconnect recovery.
+Parallel downloads with rate-limit awareness and adaptive backoff.
 """
 import sqlite3
 import asyncio
@@ -24,6 +24,11 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# ── Rate limit tuning ─────────────────────────────────────────────────────
+RATE_LIMIT_COOLDOWN = 30.0       # Seconds to pause all downloads after 429
+RATE_LIMIT_MAX_COOLDOWN = 120.0  # Maximum cooldown (caps exponential backoff)
+RATE_LIMIT_RETRY_ATTEMPTS = 5    # Max retries per file
 
 
 class DownloadDB:
@@ -70,7 +75,6 @@ class DownloadDB:
                 )
 
     def remove_entry(self, file_id: str):
-        """Remove a download record (e.g. when file was deleted from disk)."""
         with self._lock:
             with sqlite3.connect(str(self.db_path)) as conn:
                 conn.execute("DELETE FROM downloaded WHERE file_id = ?", (file_id,))
@@ -96,7 +100,7 @@ class DownloadJob:
 
 
 class TelegramEngine:
-    """Core engine with parallel download support and disconnect recovery."""
+    """Core engine with parallel downloads and adaptive rate-limit handling."""
 
     DEFAULT_CONCURRENT_DOWNLOADS = 8
     DEFAULT_CONCURRENT_CHANNELS = 2
@@ -120,6 +124,11 @@ class TelegramEngine:
         self._speed_lock = threading.Lock()
         self._disconnect_lock = asyncio.Lock()
 
+        # Rate limit tracking
+        self._rate_limited_until = 0.0
+        self._rate_limit_lock = asyncio.Lock()
+        self._consecutive_429s = 0
+
     def set_callbacks(self, log=None, speed=None):
         self._log_callback = log
         self._speed_callback = speed
@@ -133,6 +142,8 @@ class TelegramEngine:
         self._bytes_total = 0
         self._active_count = 0
         self._speed_start = 0.0
+        self._consecutive_429s = 0
+        self._rate_limited_until = 0.0
 
     def _log(self, msg: str):
         if self._log_callback:
@@ -155,7 +166,6 @@ class TelegramEngine:
             )
 
     async def _ensure_connected(self):
-        """Ensure the client is connected, reconnecting if needed."""
         if not self.client:
             return
         async with self._disconnect_lock:
@@ -166,6 +176,38 @@ class TelegramEngine:
                 except Exception as e:
                     self._log(f"Reconnect failed: {e}")
                     raise
+
+    async def _wait_rate_limit(self):
+        """Wait if we're currently rate-limited. Returns True if we waited."""
+        async with self._rate_limit_lock:
+            remaining = self._rate_limited_until - time.monotonic()
+            if remaining > 0:
+                self._log(f"Rate limited — cooling down {remaining:.0f}s...")
+                await asyncio.sleep(remaining)
+                return True
+            return False
+
+    async def _handle_429(self):
+        """Called when a download gets HTTP 429. Applies exponential backoff."""
+        async with self._rate_limit_lock:
+            self._consecutive_429s += 1
+            cooldown = min(
+                RATE_LIMIT_COOLDOWN * (2 ** (self._consecutive_429s - 1)),
+                RATE_LIMIT_MAX_COOLDOWN,
+            )
+            self._rate_limited_until = time.monotonic() + cooldown
+            self._log(f"HTTP 429 — backing off {cooldown:.0f}s (strike {self._consecutive_429s})")
+
+    async def _reset_rate_limit(self):
+        """Reset rate limit counter after successful downloads."""
+        async with self._rate_limit_lock:
+            if self._consecutive_429s > 0:
+                self._consecutive_429s = max(0, self._consecutive_429s - 1)
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Check if an error is an HTTP 429 or MTProto flood wait."""
+        msg = str(error).lower()
+        return "429" in msg or "too many requests" in msg or "flood" in msg
 
     # ── Auth ───────────────────────────────────────────────────────────
 
@@ -300,16 +342,13 @@ class TelegramEngine:
 
             stats["total"] += 1
 
-            # Check DB + disk: if DB says downloaded but file missing, clear DB entry
             if self.db.is_downloaded(job.file_id):
                 if job.filepath.exists():
                     stats["skipped"] += 1
                     continue
                 else:
-                    # File was deleted — remove the stale DB entry
                     self.db.remove_entry(job.file_id)
 
-            # Belt-and-suspenders: check disk again
             if job.filepath.exists():
                 stats["skipped"] += 1
                 continue
@@ -336,35 +375,52 @@ class TelegramEngine:
                     self._active_count += 1
                 self._emit_speed()
 
-                for attempt in range(3):  # Retry up to 3 times
+                for attempt in range(RATE_LIMIT_RETRY_ATTEMPTS):
+                    if self._cancel_flag:
+                        break
+
+                    # Wait if globally rate-limited
+                    await self._wait_rate_limit()
+
                     try:
                         await self._ensure_connected()
                         message = await self.client.get_messages(job.channel_id, ids=job.message_id)
                         if not message or not message.media:
-                            break  # No point retrying if message missing
+                            break
 
                         path = await self.client.download_media(message, str(job.filepath))
                         if path:
                             actual_size = job.filepath.stat().st_size if job.filepath.exists() else job.estimated_size
                             self.db.mark_downloaded(job.file_id, job.channel_id, job.filename, actual_size)
+                            await self._reset_rate_limit()
                             self._emit_speed(just_finished=actual_size)
                             self._log(f"  OK {job.filename} ({self._fmt_size(actual_size)})")
                             return True
-                        break  # download_media returned None — don't retry
+                        break
 
                     except FloodWaitError as e:
-                        self._log(f"Rate limited - waiting {e.seconds}s...")
+                        self._log(f"Flood wait {e.seconds}s — pausing...")
+                        await self._handle_429()
                         await asyncio.sleep(e.seconds + 1)
-                        continue  # Retry after waiting
+                        continue
 
                     except Exception as e:
                         err_msg = str(e)
+
                         if "disconnected" in err_msg.lower():
-                            self._log(f"Disconnected - reconnecting and retrying ({attempt + 1}/3)...")
+                            self._log(f"Disconnected — retry {attempt + 1}/{RATE_LIMIT_RETRY_ATTEMPTS}")
                             await asyncio.sleep(2)
-                            continue  # Retry after reconnect
+                            continue
+
+                        if self._is_rate_limit_error(e):
+                            self._log(f"Rate limited — retry {attempt + 1}/{RATE_LIMIT_RETRY_ATTEMPTS}")
+                            await self._handle_429()
+                            await asyncio.sleep(1)
+                            continue
+
+                        # Unknown error — don't retry
                         self._log(f"Error: {job.filename} - {e}")
-                        break  # Don't retry on non-disconnect errors
+                        break
 
                 self._emit_speed(just_finished=0)
                 return False
