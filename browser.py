@@ -32,8 +32,9 @@ class MediaItem:
         self.message_date = message_date
         self.is_video = is_video
         self.thumb_bytes = thumb_bytes
-        self.selected = tk.BooleanVar(value=True)
+        self.selected = True  # plain bool, safe from any thread
         self.thumb_image = None
+        self._check_var = None  # tk.BooleanVar, set during render on main thread
 
 
 class MediaBrowser(tk.Toplevel):
@@ -355,11 +356,13 @@ class MediaBrowser(tk.Toplevel):
                 fill=tk.X, padx=4)
 
             # Checkbox
-            tk.Checkbutton(cell, text="Download", variable=item.selected,
-                           bg=BG2, fg=FG, selectcolor=BG3,
-                           activebackground=BG2, activeforeground=FG,
-                           font=("Segoe UI", 8),
-                           command=self._update_counts).pack(pady=(1, 2))
+            item._check_var = tk.BooleanVar(value=item.selected)
+            cb = tk.Checkbutton(cell, text="Download", variable=item._check_var,
+                                bg=BG2, fg=FG, selectcolor=BG3,
+                                activebackground=BG2, activeforeground=FG,
+                                font=("Segoe UI", 8),
+                                command=lambda it=item: self._on_check_toggle(it))
+            cb.pack(pady=(1, 2))
 
         self._batch_index = end
         if self._batch_index < len(self.items):
@@ -369,7 +372,15 @@ class MediaBrowser(tk.Toplevel):
             self._dl_btn.config(state=tk.NORMAL)
 
     def _toggle_item(self, item):
-        item.selected.set(not item.selected.get())
+        item.selected = not item.selected
+        if item._check_var:
+            item._check_var.set(item.selected)
+        self._update_counts()
+
+    def _on_check_toggle(self, item):
+        """Called when checkbox is clicked."""
+        if item._check_var:
+            item.selected = item._check_var.get()
         self._update_counts()
 
     def _create_placeholder(self):
@@ -403,32 +414,38 @@ class MediaBrowser(tk.Toplevel):
 
     def _select_all(self):
         for item in self.items:
-            item.selected.set(True)
+            item.selected = True
+            if item._check_var:
+                item._check_var.set(True)
         self._update_counts()
 
     def _deselect_all(self):
         for item in self.items:
-            item.selected.set(False)
+            item.selected = False
+            if item._check_var:
+                item._check_var.set(False)
         self._update_counts()
 
     def _invert_selection(self):
         for item in self.items:
-            item.selected.set(not item.selected.get())
+            item.selected = not item.selected
+            if item._check_var:
+                item._check_var.set(item.selected)
         self._update_counts()
 
     def _update_counts(self):
         if not self.items:
             return
-        selected = sum(1 for it in self.items if it.selected.get())
+        selected = sum(1 for it in self.items if it.selected)
         total = len(self.items)
-        total_size = sum(it.job.estimated_size for it in self.items if it.selected.get())
+        total_size = sum(it.job.estimated_size for it in self.items if it.selected)
         size_str = self.engine._fmt_size(total_size)
         self._selected_label.config(text=f"{selected} / {total} selected  \u2022  {size_str}")
         self._dl_btn.config(text=f"Download Selected ({selected})")
         self._dl_btn.config(state=tk.NORMAL if selected > 0 else tk.DISABLED)
 
     def _on_download(self):
-        selected_jobs = [it.job for it in self.items if it.selected.get()]
+        selected_jobs = [it.job for it in self.items if it.selected]
         if not selected_jobs:
             return
         count = len(selected_jobs)
