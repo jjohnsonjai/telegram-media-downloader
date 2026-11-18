@@ -478,6 +478,10 @@ class TelegramDownloaderGUI:
                                        style="Accent.TButton", command=self._on_download)
         self.download_btn.pack(side=tk.LEFT)
 
+        self.browse_btn = ttk.Button(action, text="🔍 Browse Media",
+                                     command=self._on_browse_media)
+        self.browse_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         self.cancel_btn = ttk.Button(action, text="■ Cancel", style="Danger.TButton",
                                      command=self._on_cancel, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -887,6 +891,54 @@ class TelegramDownloaderGUI:
             self.dl_dir_var.delete(0, tk.END)
             self.dl_dir_var.insert(0, d)
             self.config.download_dir = d
+
+    def _on_browse_media(self):
+        """Open the thumbnail browser for selected channels."""
+        selected_ids = [cid for cid, var in self._channel_vars.items() if var.get()]
+        if not selected_ids:
+            messagebox.showwarning("No Selection", "Please select at least one channel in the Channels tab.")
+            return
+
+        dl_dir = self.dl_dir_var.get().strip()
+        if not dl_dir:
+            messagebox.showerror("Error", "Please specify a download directory.")
+            return
+        self.config.download_dir = dl_dir
+
+        selected_channels = [ch for ch in self._channels if ch["id"] in selected_ids]
+
+        self._set_status("Opening media browser...")
+        self.browse_btn.config(state=tk.DISABLED)
+
+        # Import here to avoid circular import
+        from browser import MediaBrowser
+
+        browser = MediaBrowser(self.root, self.engine, selected_channels, dl_dir, self.loop)
+        self.root.wait_window(browser)
+
+        self.browse_btn.config(state=tk.NORMAL)
+        self._set_status("Ready")
+
+        # Get selected jobs
+        jobs = browser.get_selected_jobs()
+        if not jobs:
+            return
+
+        # Start downloading selected jobs
+        self._download_active = True
+        self.download_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
+        self._notebook.select(2)
+
+        self.engine.reset_cancel()
+        self.engine.set_callbacks(log=self._append_log, speed=self._on_speed_update)
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start(10)
+
+        self._run_async(
+            self.engine.download_jobs(jobs, dl_dir),
+            self._on_download_complete,
+        )
 
     def _on_download(self):
         selected_ids = [cid for cid, var in self._channel_vars.items() if var.get()]

@@ -300,6 +300,79 @@ class TelegramEngine:
 
         return aggregated
 
+    async def download_jobs(self, jobs: list, download_dir: str) -> dict:
+        """Download a specific list of DownloadJobs (from the media browser)."""
+        if not self.client:
+            raise RuntimeError("Client not connected")
+        if not jobs:
+            return {"downloaded": 0, "skipped": 0, "errors": 0, "total": 0}
+
+        self._bytes_downloaded = 0
+        self._bytes_total = sum(j.estimated_size for j in jobs)
+        self._active_count = 0
+        self._speed_start = time.monotonic()
+
+        stats = {"downloaded": 0, "skipped": 0, "errors": 0, "total": len(jobs)}
+        sem = asyncio.Semaphore(self.concurrent_downloads)
+
+        async def download_one(job) -> bool:
+            if self._cancel_flag:
+                return False
+            async with sem:
+                with self._speed_lock:
+                    self._active_count += 1
+                self._emit_speed()
+                for attempt in range(RATE_LIMIT_RETRY_ATTEMPTS):
+                    if self._cancel_flag:
+                        break
+                    await self._wait_rate_limit()
+                    try:
+                        await self._ensure_connected()
+                        message = await self.client.get_messages(job.channel_id, ids=job.message_id)
+                        if not message or not message.media:
+                            break
+                        path = await self.client.download_media(message, str(job.filepath))
+                        if path:
+                            actual_size = job.filepath.stat().st_size if job.filepath.exists() else job.estimated_size
+                            self.db.mark_downloaded(job.file_id, job.channel_id, job.filename, actual_size)
+                            await self._reset_rate_limit()
+                            self._emit_speed(just_finished=actual_size)
+                            self._log(f"  OK {job.filename} ({self._fmt_size(actual_size)})")
+                            return True
+                        break
+                    except FloodWaitError as e:
+                        self._log(f"Flood wait {e.seconds}s — pausing...")
+                        await self._handle_429()
+                        await asyncio.sleep(e.seconds + 1)
+                        continue
+                    except Exception as e:
+                        err_msg = str(e)
+                        if "disconnected" in err_msg.lower():
+                            self._log(f"Disconnected — retry {attempt + 1}/{RATE_LIMIT_RETRY_ATTEMPTS}")
+                            await asyncio.sleep(2)
+                            continue
+                        if self._is_rate_limit_error(e):
+                            self._log(f"Rate limited — retry {attempt + 1}/{RATE_LIMIT_RETRY_ATTEMPTS}")
+                            await self._handle_429()
+                            await asyncio.sleep(1)
+                            continue
+                        self._log(f"Error: {job.filename} - {e}")
+                        break
+                self._emit_speed(just_finished=-1)
+                return False
+
+        tasks = [asyncio.create_task(download_one(job)) for job in jobs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for r in results:
+            if r is True:
+                stats["downloaded"] += 1
+            else:
+                stats["errors"] += 1
+
+        self._log(f"Done: {stats['downloaded']} dl, {stats['errors']} err")
+        return stats
+
     async def _download_channel(self, channel_id: int, channel_title: str, download_dir: str, force: bool = False) -> dict:
         channel_dir = Path(download_dir) / self._safe_name(channel_title)
         channel_dir.mkdir(parents=True, exist_ok=True)
