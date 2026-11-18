@@ -269,7 +269,7 @@ class TelegramEngine:
 
     # ── Download engine ────────────────────────────────────────────────
 
-    async def download_all_channels(self, channels: list[dict], download_dir: str) -> dict:
+    async def download_all_channels(self, channels: list[dict], download_dir: str, force: bool = False) -> dict:
         if not self.client:
             raise RuntimeError("Client not connected")
 
@@ -285,7 +285,7 @@ class TelegramEngine:
             if self._cancel_flag:
                 return {"downloaded": 0, "skipped": 0, "errors": 0, "total": 0}
             async with chan_sem:
-                return await self._download_channel(ch["id"], ch["title"], download_dir)
+                return await self._download_channel(ch["id"], ch["title"], download_dir, force=force)
 
         tasks = [asyncio.create_task(process_one(ch)) for ch in channels]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -300,7 +300,7 @@ class TelegramEngine:
 
         return aggregated
 
-    async def _download_channel(self, channel_id: int, channel_title: str, download_dir: str) -> dict:
+    async def _download_channel(self, channel_id: int, channel_title: str, download_dir: str, force: bool = False) -> dict:
         channel_dir = Path(download_dir) / self._safe_name(channel_title)
         channel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -343,16 +343,17 @@ class TelegramEngine:
 
             stats["total"] += 1
 
-            if self.db.is_downloaded(job.file_id):
+            if not force:
+                if self.db.is_downloaded(job.file_id):
+                    if job.filepath.exists():
+                        stats["skipped"] += 1
+                        continue
+                    else:
+                        self.db.remove_entry(job.file_id)
+
                 if job.filepath.exists():
                     stats["skipped"] += 1
                     continue
-                else:
-                    self.db.remove_entry(job.file_id)
-
-            if job.filepath.exists():
-                stats["skipped"] += 1
-                continue
 
             jobs.append(job)
 

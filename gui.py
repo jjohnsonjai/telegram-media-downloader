@@ -482,6 +482,17 @@ class TelegramDownloaderGUI:
                                      command=self._on_cancel, state=tk.DISABLED)
         self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        # Force re-download checkbox
+        self.force_var = tk.BooleanVar(value=False)
+        self.force_cb = tk.Checkbutton(action, text="Force re-download (ignore history)",
+                                       variable=self.force_var,
+                                       bg=THEME["bg"], fg=THEME["fg_dim"],
+                                       selectcolor=THEME["bg3"],
+                                       activebackground=THEME["bg"],
+                                       activeforeground=THEME["fg"],
+                                       font=("Segoe UI", 8))
+        self.force_cb.pack(side=tk.LEFT, padx=(15, 0))
+
         # Speed / progress
         self.speed_frame = tk.Frame(action, bg=THEME["bg"])
         self.speed_frame.pack(side=tk.RIGHT)
@@ -897,7 +908,8 @@ class TelegramDownloaderGUI:
 
         if not messagebox.askyesno("Confirm Download",
                                    f"Download all media from:\n\n{names}\n\n"
-                                   f"{count} channel(s) • {self.engine.concurrent_downloads} parallel"):
+                                   f"{count} channel(s) • {self.engine.concurrent_downloads} parallel"
+                                   f"{' • FORCE MODE (ignoring history)' if force else ''}"):
             return
 
         self._download_active = True
@@ -910,8 +922,12 @@ class TelegramDownloaderGUI:
         self.progress_bar.configure(mode="indeterminate")
         self.progress_bar.start(10)
 
+        force = self.force_var.get()
+        if force:
+            self._append_log("FORCE MODE: ignoring download history\n")
+
         self._run_async(
-            self.engine.download_all_channels(selected_channels, dl_dir),
+            self.engine.download_all_channels(selected_channels, dl_dir, force=force),
             self._on_download_complete,
         )
 
